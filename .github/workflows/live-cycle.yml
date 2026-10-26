@@ -7,11 +7,10 @@
 # This runs the same script on a GitHub runner so the site keeps updating while
 # the machine is closed.
 #
-# Cadence: every 30 minutes, because that is the site's requirement (INSAT
-# detects at 15 minutes; the cycle itself runs in ~12). One cycle is ~12
-# Actions minutes, so this cadence is ~16,700 minutes/month — free **only**
-# because a public repository gets unlimited minutes. On a private repository
-# that is ~$118/month, so the first step refuses to run there unless the
+# Cadence: about every 23 minutes — an 8-minute cycle plus a 15-minute wait in
+# the chain below — because that is the site's requirement (INSAT detects at 15
+# minutes). A public repository gets unlimited Actions minutes; on a private one
+# this cadence is ~$90/month, so the first step refuses to run there unless the
 # repository variable ALLOW_PRIVATE_PAID is set. See docs/CI_SETUP.md for the
 # arithmetic and for the private-repo fallback (one cron line).
 #
@@ -205,7 +204,7 @@ jobs:
       # then dispatches the next one, so the site keeps refreshing whether or
       # not cron fires. The concurrency group above serialises the chain.
       #
-      # It only fires when the served data is actually stale (>=20 min), so a
+      # It only fires when the served data is actually stale (>=10 min), so a
       # cron run that did land does not get doubled by the chain. A run with no
       # SCHEDULE_TOKEN still ends green but shows a warning HTTP code here.
       - name: Continue the chain
@@ -216,11 +215,11 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
-          sleep 1500                      # 25 min of quiet between cycles
+          sleep 900                       # 15 min of quiet between cycles
           AGE=$(curl -fsS --max-time 20 "https://sih26ekaant.web.app/api/health?probe=$(date +%s)" \
             | python3 -c 'import json,sys,datetime as d; g=d.datetime.fromisoformat(json.load(sys.stdin)["cycle_generated_at_utc"]); print(int((d.datetime.now(d.timezone.utc)-g).total_seconds()//60))' \
             || echo 999)
-          if [ "$AGE" -lt 20 ]; then
+          if [ "$AGE" -lt 10 ]; then
             echo "served cycle is ${AGE} min old - cron or another run covered this slot; not dispatching"
             exit 0
           fi

@@ -18,6 +18,9 @@ on:
 
 permissions:
   contents: read
+  # The alert below files and closes an issue, so the staleness is visible
+  # wherever the repository's notifications land instead of only in Actions.
+  issues: write
 
 jobs:
   ping:
@@ -61,3 +64,44 @@ jobs:
               sys.exit(1)
           print("OK")
           PY
+
+      # A red X only helps someone who is watching Actions. One issue, kept open
+      # for as long as the site is stale, carries the signal into whatever
+      # notifications the repository already has.
+      - name: File or refresh the staleness issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          SEARCH='Live cycle has not published recently in:title'
+          RUN_URL="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --repo "$REPO" --state open --search "$SEARCH" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" \
+              --body "Still stale at $(date -u +%FT%TZ)Z. Probe run: $RUN_URL"
+            echo "commented on issue #$existing"
+          else
+            gh issue create --repo "$REPO" --title "Live cycle has not published recently" \
+              --body "$(printf 'The cycle serving sih26ekaant.web.app is older than the alert limit, so the site is showing stale data.\n\nProbe run: %s\n\nIf the dispatch chain is intact a cycle publishes within about 25 minutes, and this issue closes itself on the next fresh probe.' "$RUN_URL")"
+            echo "filed a staleness issue"
+          fi
+
+      - name: Close the issue once the site is fresh again
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --repo "$REPO" --state open \
+            --search 'Live cycle has not published recently in:title' \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "The served cycle is fresh again at $(date -u +%FT%TZ)Z."
+            echo "closed issue #$existing"
+          else
+            echo 'no open staleness issue'
+          fi
