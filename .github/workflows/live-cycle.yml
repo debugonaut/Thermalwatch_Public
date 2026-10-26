@@ -197,3 +197,40 @@ jobs:
         run: |
           echo "### Live cycle published" >> "$GITHUB_STEP_SUMMARY"
           cat frontend/public/data/live_api/health.json >> "$GITHUB_STEP_SUMMARY" || true
+
+      # GitHub's own cron scheduler has been dropping scheduled fires platform-
+      # wide (community discussion #206019: a fire creates no run at all, and
+      # workflow_dispatch still works within seconds). This chain survives that
+      # without any external service: once a cycle has finished, it waits and
+      # then dispatches the next one, so the site keeps refreshing whether or
+      # not cron fires. The concurrency group above serialises the chain.
+      #
+      # It only fires when the served data is actually stale (>=20 min), so a
+      # cron run that did land does not get doubled by the chain. A run with no
+      # SCHEDULE_TOKEN still ends green but shows a warning HTTP code here.
+      - name: Continue the chain
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          sleep 1500                      # 25 min of quiet between cycles
+          AGE=$(curl -fsS --max-time 20 "https://sih26ekaant.web.app/api/health?probe=$(date +%s)" \
+            | python3 -c 'import json,sys,datetime as d; g=d.datetime.fromisoformat(json.load(sys.stdin)["cycle_generated_at_utc"]); print(int((d.datetime.now(d.timezone.utc)-g).total_seconds()//60))' \
+            || echo 999)
+          if [ "$AGE" -lt 20 ]; then
+            echo "served cycle is ${AGE} min old - cron or another run covered this slot; not dispatching"
+            exit 0
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::SCHEDULE_TOKEN is not set, so the chain cannot dispatch the next cycle - the site will only refresh when cron fires"
+            exit 0
+          fi
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/live-cycle.yml/dispatches" \
+            -d '{"ref":"main"}')
+          echo "dispatched the next cycle at $(date -u +%FT%TZ) -> HTTP $CODE"
+          [ "$CODE" = 204 ]
