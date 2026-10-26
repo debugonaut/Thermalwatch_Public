@@ -113,6 +113,16 @@ jobs:
       # public one — model packages and tiles must not land there. It is ~1 GB
       # from the same release, which is a minute or two at runner speed.
 
+      # The venv must exist before provisioning: verify_with_project("cycle")
+      # imports numpy/shapely through pipeline.sovereignty, and the bare runner
+      # Python has none of the requirements installed. On the laptop this check
+      # always ran on a machine that already had .venv — CI does not.
+      - name: Create the virtualenv the cycle expects
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements-live.txt
+
       - name: Provision artifacts from the live-artifacts release
         env:
           LIVE_ARTIFACTS_REPO: ${{ vars.CORE_REPO || github.repository }}
@@ -121,7 +131,7 @@ jobs:
           # placement needs a PAT that can read it; the core placement falls
           # back to its own run token.
           LIVE_ARTIFACTS_TOKEN: ${{ secrets.CORE_PAT || secrets.GITHUB_TOKEN }}
-        run: python -m pipeline.provision_live_artifacts
+        run: .venv/bin/python -m pipeline.provision_live_artifacts
 
       - name: Fill the checkout with everything the live site serves
         run: bash deploy/ci/hydrate_web_assets.sh
@@ -132,12 +142,6 @@ jobs:
         run: |
           test -n "$LIVE_ENV" || { echo "::error::LIVE_ENV secret is empty"; exit 1; }
           printf '%s\n' "$LIVE_ENV" > .env
-
-      - name: Create the virtualenv the cycle expects
-        run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -r requirements-live.txt
 
       - name: Install frontend dependencies
         run: npm ci
