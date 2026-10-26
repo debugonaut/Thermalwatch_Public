@@ -1,0 +1,62 @@
+# Hourly ping of the live site.
+#
+# One small request an hour — never the app — that proves the site answers and
+# that the served cycle is still fresh. The staleness check is the real point:
+# if the live cycle stops publishing (a failed run, an expired secret, a
+# quota), this job turns red on the repository instead of the site quietly
+# serving a stale archive for a month.
+#
+# This replaces the local launchd ping (deploy/launchd/com.thermalwatch.uptime-
+# ping.plist), which only runs while the laptop is awake.
+
+name: Uptime ping
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe the health endpoint
+        env:
+          SITE: https://sih26ekaant.web.app
+          # Two missed 6-hour cycles means something is wrong, not busy.
+          MAX_AGE_HOURS: '12'
+        run: |
+          set -euo pipefail
+          export BODY_PATH="$RUNNER_TEMP/health.json"
+          curl -fsS --max-time 30 -D "$RUNNER_TEMP/headers" -o "$BODY_PATH" \
+            "$SITE/api/health?probe=$(date +%s)"
+          grep -iE '^(HTTP|content-type)' "$RUNNER_TEMP/headers" || true
+          cat "$BODY_PATH"
+          {
+            echo "### Uptime ping"
+            echo '```json'
+            cat "$BODY_PATH"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import datetime, json, os, sys
+
+          with open(os.environ["BODY_PATH"]) as fh:
+              doc = json.load(fh)
+
+          generated = datetime.datetime.fromisoformat(doc["cycle_generated_at_utc"])
+          age_h = (datetime.datetime.now(datetime.timezone.utc) - generated).total_seconds() / 3600
+          limit = float(os.environ["MAX_AGE_HOURS"])
+          archive = doc.get("archive", {})
+          print(f"cycle generated {generated.isoformat()} -> age {age_h:.1f} h (limit {limit:.0f} h)")
+          print(f"archive through {archive.get('last_date')} | {archive.get('detections')} detections")
+          if age_h > limit:
+              print(f"::error::served cycle is {age_h:.1f} h old - the live cycle has stopped publishing")
+              sys.exit(1)
+          print("OK")
+          PY
