@@ -32,6 +32,15 @@ on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
+    inputs:
+      wait_minutes:
+        description: 'Minutes to idle before starting (chain spacing; 0 = start now)'
+        required: false
+        default: '0'
+      chained:
+        description: 'Set by the chain so only one lineage ever runs (1 = came from the chain)'
+        required: false
+        default: '0'
 
 permissions:
   contents: write
@@ -61,6 +70,64 @@ jobs:
             exit 1
           fi
           echo "repository private=$PRIVATE — cadence affordable"
+
+      # GitHub's cron scheduler drops scheduled fires platform-wide (a fire can
+      # create no run at all while a dispatch still lands in seconds), so the
+      # loop renews itself instead of relying on cron. The successor is created
+      # in the first seconds of this run, not after the cycle: a runner killed
+      # mid-run - the failure that stopped the chain for four hours on
+      # 2026-10-26 - can no longer break the loop, because the next run already
+      # exists by then. The concurrency group above keeps the successor queued
+      # until this run ends.
+      #
+      # Exactly one successor is dispatched per run, so the population stays at
+      # one pending run. A run that did not come from the chain (cron, or a
+      # manual seed) only dispatches when no other run is alive, which revives a
+      # dead loop without ever growing a second lineage.
+      - name: Chain the successor
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
+          REPO: ${{ github.repository }}
+          CHAINED: ${{ github.event.inputs.chained }}
+          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
+          SELF: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::SCHEDULE_TOKEN is not set - the chain cannot renew itself, so only cron will refresh the site"
+            exit 0
+          fi
+          ALIVE=$(curl -fsS --max-time 20 \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs?per_page=40" \
+            | python3 -c 'import json,os,sys; me=os.environ["SELF"]; runs=json.load(sys.stdin)["workflow_runs"]; print(sum(1 for r in runs if str(r["id"]) != me and r["name"] == "Live cycle" and r["status"] in ("queued", "waiting", "pending", "in_progress")))' \
+            || echo 0)
+          if [ "${CHAINED:-}" != "1" ] && [ "$ALIVE" -gt 0 ]; then
+            echo "another live-cycle run is already pending (${ALIVE}) - not starting a second chain"
+            exit 0
+          fi
+          WAIT="${WAIT_MINUTES:-12}"
+          case "$WAIT" in (*[!0-9]*|'') WAIT=12 ;; esac
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/live-cycle.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"wait_minutes\":\"${WAIT}\",\"chained\":\"1\"}}")
+          echo "queued the next cycle at $(date -u +%FT%TZ) (wait ${WAIT} min) -> HTTP $CODE"
+          [ "$CODE" = 204 ]
+
+      # The quiet time lives at the head of the successor, so the link that keeps
+      # the loop alive is created before any idle minute is spent.
+      - name: Chain spacing
+        env:
+          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
+        run: |
+          WAIT="${WAIT_MINUTES:-0}"
+          case "$WAIT" in (*[!0-9]*|'') WAIT=0 ;; esac
+          if [ "$WAIT" -gt 0 ]; then
+            echo "waiting ${WAIT} min before this cycle"
+            sleep $((WAIT * 60))
+          fi
 
       # The workflow may live in a public wrapper repository while the code
       # stays private: repository/token fall back to this run's own repo and
@@ -197,39 +264,11 @@ jobs:
           echo "### Live cycle published" >> "$GITHUB_STEP_SUMMARY"
           cat frontend/public/data/live_api/health.json >> "$GITHUB_STEP_SUMMARY" || true
 
-      # GitHub's own cron scheduler has been dropping scheduled fires platform-
-      # wide (community discussion #206019: a fire creates no run at all, and
-      # workflow_dispatch still works within seconds). This chain survives that
-      # without any external service: once a cycle has finished, it waits and
-      # then dispatches the next one, so the site keeps refreshing whether or
-      # not cron fires. The concurrency group above serialises the chain.
-      #
-      # It only fires when the served data is actually stale (>=10 min), so a
-      # cron run that did land does not get doubled by the chain. A run with no
-      # SCHEDULE_TOKEN still ends green but shows a warning HTTP code here.
-      - name: Continue the chain
+      - name: Report the served age
         if: always()
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
-          REPO: ${{ github.repository }}
         run: |
-          set -uo pipefail
-          sleep 900                       # 15 min of quiet between cycles
           AGE=$(curl -fsS --max-time 20 "https://sih26ekaant.web.app/api/health?probe=$(date +%s)" \
             | python3 -c 'import json,sys,datetime as d; g=d.datetime.fromisoformat(json.load(sys.stdin)["cycle_generated_at_utc"]); print(int((d.datetime.now(d.timezone.utc)-g).total_seconds()//60))' \
-            || echo 999)
-          if [ "$AGE" -lt 10 ]; then
-            echo "served cycle is ${AGE} min old - cron or another run covered this slot; not dispatching"
-            exit 0
-          fi
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::warning::SCHEDULE_TOKEN is not set, so the chain cannot dispatch the next cycle - the site will only refresh when cron fires"
-            exit 0
-          fi
-          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/actions/workflows/live-cycle.yml/dispatches" \
-            -d '{"ref":"main"}')
-          echo "dispatched the next cycle at $(date -u +%FT%TZ) -> HTTP $CODE"
-          [ "$CODE" = 204 ]
+            || echo unknown)
+          echo "served cycle age: ${AGE} min" >> "$GITHUB_STEP_SUMMARY"
