@@ -38,6 +38,9 @@ on:
 
 permissions:
   contents: write
+  # The last step files and closes an issue when Hosting stops answering, so a
+  # spent Spark quota surfaces in notifications instead of as a quiet outage.
+  issues: write
 
 concurrency:
   group: live-cycle
@@ -280,3 +283,38 @@ jobs:
             | python3 -c 'import json,sys,datetime as d; g=d.datetime.fromisoformat(json.load(sys.stdin)["cycle_generated_at_utc"]); print(int((d.datetime.now(d.timezone.utc)-g).total_seconds()//60))' \
             || echo unknown)
           echo "served cycle age: ${AGE} min" >> "$GITHUB_STEP_SUMMARY"
+
+      # The cycle is the only thing guaranteed to keep running (GitHub's cron is
+      # not), so it is also the only thing that can reliably notice Hosting
+      # going dark. Spark's spent transfer quota can disable the site with no
+      # code failing anywhere - the deploy still succeeds, the map is simply
+      # unreachable - and that would otherwise look like a quiet, healthy night.
+      # One issue per outage, refreshed not duplicated, is enough to reach the
+      # inbox that watches this repository.
+      - name: Alert when the live site stops answering
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if curl -fsS --max-time 25 "https://sih26ekaant.web.app/api/health?probe=$(date +%s)" >/dev/null; then
+            # Answering again: close the outage so the next real one opens fresh.
+            SEARCH='Live site stopped answering in:title'
+            existing=$(gh issue list --repo "$REPO" --state open --search "$SEARCH" --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$REPO" --comment "Answering again at $(date -u +%FT%TZ)."
+            fi
+            exit 0
+          fi
+          SEARCH='Live site stopped answering in:title'
+          RUN_URL="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --repo "$REPO" --state open --search "$SEARCH" --json number --jq '.[0].number // empty')
+          BODY="https://sih26ekaant.web.app did not answer the health probe at $(date -u +%FT%TZ). On Spark this is what the spent monthly Hosting transfer quota looks like from the outside - it clears when the quota resets on the 1st. Probe run: $RUN_URL"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Still dark at $(date -u +%FT%TZ). Probe run: $RUN_URL"
+            echo "commented on issue #$existing"
+          else
+            gh issue create --repo "$REPO" --title "Live site stopped answering" --body "$BODY"
+          fi
