@@ -95,8 +95,11 @@ jobs:
             "https://api.github.com/repos/$REPO/actions/runs?per_page=40" \
             | python3 -c 'import json,os,sys; me=os.environ["SELF"]; runs=json.load(sys.stdin)["workflow_runs"]; print(sum(1 for r in runs if str(r["id"]) != me and r["name"] == "Live cycle" and r["status"] in ("queued", "waiting", "pending", "in_progress")))' \
             || echo 0)
-          if [ "$ALIVE" -gt 0 ]; then
-            echo "another live-cycle run is already queued or running (${ALIVE}) - not starting a second chain"
+          # Two, not one: when a chained run starts, the parent can still be
+          # listed as in_progress for a few seconds, and treating that as a
+          # duplicate stopped the chain for good on 2026-10-26 17:01.
+          if [ "$ALIVE" -ge 2 ]; then
+            echo "${ALIVE} live-cycle runs are already queued or running - not starting a second chain"
             exit 0
           fi
           CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
