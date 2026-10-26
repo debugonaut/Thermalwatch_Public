@@ -165,6 +165,15 @@ jobs:
       - name: Run the cycle
         run: ./scripts/refresh_live_cycle.sh
 
+      # refresh_live_cycle.sh redirects all of its output into logs/live_refresh.log,
+      # so a failure here would otherwise show an empty red step. Surface the tail.
+      - name: Cycle log tail (on failure)
+        if: failure()
+        run: |
+          echo '::group::tail -n 200 logs/live_refresh.log'
+          tail -n 200 logs/live_refresh.log 2>/dev/null || echo 'no log file written'
+          echo '::endgroup::'
+
       # Persist the loop's history for the next run — as an asset on the private
       # release, never as a cache, for the same reason as the restore above. A
       # failed cycle keeps the previous state rather than publishing a partial
