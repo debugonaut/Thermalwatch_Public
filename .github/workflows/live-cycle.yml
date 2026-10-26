@@ -237,7 +237,7 @@ jobs:
             --project="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["project_id"])' "$RUNNER_TEMP/firebase-sa.json")"
 
       - name: Run the cycle
-        run: ./scripts/refresh_live_cycle.sh --force
+        run: ./scripts/refresh_live_cycle.sh
 
       # refresh_live_cycle.sh redirects all of its output into logs/live_refresh.log,
       # so a failure here would otherwise show an empty red step. Surface the tail.
