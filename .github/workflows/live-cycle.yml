@@ -31,16 +31,10 @@ name: Live cycle
 on:
   schedule:
     - cron: '*/30 * * * *'
+  # No inputs: a dispatch's inputs did not reach the successor on 2026-10-26
+  # (`github.event.inputs` arrived empty), so the chain measures its own spacing
+  # from the run history instead of trusting a payload.
   workflow_dispatch:
-    inputs:
-      wait_minutes:
-        description: 'Minutes to idle before starting (chain spacing; 0 = start now)'
-        required: false
-        default: '0'
-      chained:
-        description: 'Set by the chain so only one lineage ever runs (1 = came from the chain)'
-        required: false
-        default: '0'
 
 permissions:
   contents: write
@@ -89,8 +83,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
           REPO: ${{ github.repository }}
-          CHAINED: ${{ github.event.inputs.chained }}
-          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
           SELF: ${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -103,30 +95,43 @@ jobs:
             "https://api.github.com/repos/$REPO/actions/runs?per_page=40" \
             | python3 -c 'import json,os,sys; me=os.environ["SELF"]; runs=json.load(sys.stdin)["workflow_runs"]; print(sum(1 for r in runs if str(r["id"]) != me and r["name"] == "Live cycle" and r["status"] in ("queued", "waiting", "pending", "in_progress")))' \
             || echo 0)
-          if [ "${CHAINED:-}" != "1" ] && [ "$ALIVE" -gt 0 ]; then
-            echo "another live-cycle run is already pending (${ALIVE}) - not starting a second chain"
+          if [ "$ALIVE" -gt 0 ]; then
+            echo "another live-cycle run is already queued or running (${ALIVE}) - not starting a second chain"
             exit 0
           fi
-          WAIT="${WAIT_MINUTES:-12}"
-          case "$WAIT" in (*[!0-9]*|'') WAIT=12 ;; esac
           CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/actions/workflows/live-cycle.yml/dispatches" \
-            -d "{\"ref\":\"main\",\"inputs\":{\"wait_minutes\":\"${WAIT}\",\"chained\":\"1\"}}")
-          echo "queued the next cycle at $(date -u +%FT%TZ) (wait ${WAIT} min) -> HTTP $CODE"
+            -d '{"ref":"main"}')
+          echo "queued the next cycle at $(date -u +%FT%TZ) -> HTTP $CODE"
           [ "$CODE" = 204 ]
 
       # The quiet time lives at the head of the successor, so the link that keeps
       # the loop alive is created before any idle minute is spent.
+      # Spacing comes from the run history, not from a dispatch payload: the
+      # chain starts its successor immediately (so a killed runner cannot break
+      # the loop) and each run then waits out the remainder of the target gap.
       - name: Chain spacing
+        continue-on-error: true
         env:
-          WAIT_MINUTES: ${{ github.event.inputs.wait_minutes }}
+          GH_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
+          REPO: ${{ github.repository }}
+          SELF: ${{ github.run_id }}
+          TARGET_SECONDS: '1320'          # 22 min between run starts
         run: |
-          WAIT="${WAIT_MINUTES:-0}"
-          case "$WAIT" in (*[!0-9]*|'') WAIT=0 ;; esac
+          set -uo pipefail
+          [ -n "${GH_TOKEN:-}" ] || exit 0
+          ELAPSED=$(curl -fsS --max-time 20 \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs?per_page=30" \
+            | python3 -c 'import json,os,sys,datetime as d; me=os.environ["SELF"]; now=d.datetime.now(d.timezone.utc); runs=[r for r in json.load(sys.stdin)["workflow_runs"] if r["name"]=="Live cycle"]; mine=[r for r in runs if str(r["id"])==me]; starts=[d.datetime.fromisoformat(r["run_started_at"].replace("Z","+00:00")) for r in runs if str(r["id"])!=me and r.get("run_started_at")]; print(int((now-max((s for s in starts if mine and s < d.datetime.fromisoformat(mine[0]["run_started_at"].replace("Z","+00:00"))), default=now)).total_seconds()))' \
+            || echo 0)
+          case "$ELAPSED" in (*[!0-9]*|'') ELAPSED=0 ;; esac
+          WAIT=$(( ${TARGET_SECONDS:-1320} - ELAPSED ))
+          echo "previous cycle started ${ELAPSED}s ago; target gap ${TARGET_SECONDS}s"
           if [ "$WAIT" -gt 0 ]; then
-            echo "waiting ${WAIT} min before this cycle"
-            sleep $((WAIT * 60))
+            echo "waiting ${WAIT}s before this cycle"
+            sleep "$WAIT"
           fi
 
       # The workflow may live in a public wrapper repository while the code
