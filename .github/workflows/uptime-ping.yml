@@ -27,8 +27,9 @@ jobs:
       - name: Probe the health endpoint
         env:
           SITE: https://sih26ekaant.web.app
-          # Two missed 6-hour cycles means something is wrong, not busy.
-          MAX_AGE_HOURS: '12'
+          # The cycle runs every 30 minutes, so two hours is four missed slots —
+          # that is a broken pipeline, not scheduler jitter or a slow run.
+          MAX_AGE_HOURS: '2'
         run: |
           set -euo pipefail
           export BODY_PATH="$RUNNER_TEMP/health.json"
