@@ -1,0 +1,73 @@
+# Temporary diagnostic: why does the MOSDAC poll fail with ENETUNREACH from CI?
+#
+# Delete once the cause is recorded.  It sends no credentials and writes nothing.
+name: Source probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: DNS and per-family connectivity to MOSDAC
+        run: |
+          python3 - <<'PY'
+          import json, socket, ssl, time, urllib.request
+
+          HOST = "mosdac.gov.in"
+          URL = "https://mosdac.gov.in/download_api/gettoken"
+
+          print("== getaddrinfo by family")
+          for fam, label in ((socket.AF_INET, "IPv4"), (socket.AF_INET6, "IPv6"),
+                             (socket.AF_UNSPEC, "UNSPEC")):
+              try:
+                  info = socket.getaddrinfo(HOST, 443, fam, socket.SOCK_STREAM)
+                  print(f"  {label}: {sorted({x[4][0] for x in info})}")
+              except Exception as exc:
+                  print(f"  {label}: ERROR {type(exc).__name__}: {exc}")
+
+          print("== raw TCP connect per address")
+          try:
+              info = socket.getaddrinfo(HOST, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+          except Exception as exc:
+              print(f"  getaddrinfo failed: {exc}")
+              info = []
+          for af, socktype, proto, _, sa in info:
+              family = "IPv6" if af == socket.AF_INET6 else "IPv4"
+              started = time.time()
+              try:
+                  sock = socket.socket(af, socktype, proto)
+                  sock.settimeout(15)
+                  sock.connect(sa)
+                  print(f"  {family} {sa[0]} -> OK in {time.time()-started:.2f}s")
+                  sock.close()
+              except Exception as exc:
+                  print(f"  {family} {sa[0]} -> {type(exc).__name__}: {exc}")
+
+          print("== plain urllib (what the pipeline does today)")
+          started = time.time()
+          try:
+              with urllib.request.urlopen(URL, timeout=30) as response:
+                  print(f"  status {response.status} in {time.time()-started:.2f}s")
+          except Exception as exc:
+              print(f"  {type(exc).__name__}: {exc}")
+
+          print("== urllib with getaddrinfo forced to IPv4")
+          original = socket.getaddrinfo
+
+          def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+              return original(host, port, socket.AF_INET, type, proto, flags)
+
+          socket.getaddrinfo = ipv4_only
+          started = time.time()
+          try:
+              request = urllib.request.Request(URL, data=b"{}",
+                                               headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  print(f"  status {response.status} in {time.time()-started:.2f}s")
+          except Exception as exc:
+              print(f"  {type(exc).__name__}: {exc}")
+          finally:
+              socket.getaddrinfo = original
+          PY
