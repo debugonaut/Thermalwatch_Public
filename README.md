@@ -8,8 +8,8 @@ two workflow files in `.github/workflows/`:
 
 | Workflow | Cadence | What it does |
 |---|---|---|
-| `live-cycle.yml` | every 30 minutes | checks out the private core repository, runs the ingestion → classification → archive → deploy cycle, destroys the runner afterwards |
-| `uptime-ping.yml` | hourly | probes the site's `/api/health` and fails when the served cycle is older than 12 h |
+| `live-cycle.yml` | every ~22 minutes | checks out the private core repository, runs the ingestion → classification → archive → deploy cycle, destroys the runner afterwards. Each run dispatches its successor in its first seconds and paces that successor off the previous cycle's own start time |
+| `uptime-ping.yml` | hourly | probes the site's `/api/health`, and fails when either the site stops answering, no successful `Live cycle` run has finished in 90 minutes (the chain stopped), or the served cycle is more than 12 h old (publishing stalled). A quiet satellite feed delays the deploy without breaking the loop, so liveness is judged from the run history rather than from the published timestamp |
 
 Why a wrapper: a public repository gets unlimited GitHub Actions minutes, and
 a 30-minute cadence would otherwise cost ~16,700 minutes/month on a private
@@ -33,7 +33,7 @@ repository. The core repository stays private; its contents never appear here.
 ## Safety rails
 
 `live-cycle.yml` refuses to run if this repository is ever made private without
-the `ALLOW_PRIVATE_PAID` variable being set, because the 30-minute cadence
+the `ALLOW_PRIVATE_PAID` variable being set, because the ~22-minute cadence
 would then exceed the 2,000 free minutes/month and start a bill.
 
 Full setup notes live in the core repository's `docs/CI_SETUP.md`.

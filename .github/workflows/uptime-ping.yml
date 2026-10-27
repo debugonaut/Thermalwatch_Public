@@ -1,10 +1,24 @@
 # Hourly ping of the live site.
 #
 # One small request an hour — never the app — that proves the site answers and
-# that the served cycle is still fresh. The staleness check is the real point:
-# if the live cycle stops publishing (a failed run, an expired secret, a
-# quota), this job turns red on the repository instead of the site quietly
-# serving a stale archive for a month.
+# that the pipeline behind it is actually alive. That second part is the real
+# point: if the live cycle stops, this job turns red on the repository instead
+# of the site quietly serving an ageing archive for a month.
+#
+# Two independent signals, because they fail for different reasons:
+#
+#   * liveness — has a successful `Live cycle` run finished recently? Read from
+#     the Actions API, which every cycle touches.
+#   * staleness — is the served archive cycle very old? Read from the site.
+#
+# Only the second one can be judged from the site, and it cannot judge the
+# pipeline: the cycle deliberately skips its deploy when the ingest finds no
+# new detections, so the served `cycle_generated_at_utc` stays put for hours at
+# a time while the loop keeps cycling perfectly well. FIRMS posts new granules
+# in bursts, so a quiet feed is normal. On 2026-10-27 a two-hour limit on that
+# timestamp turned three healthy hours into a red run and a "has not published
+# recently" issue, which is why liveness now comes from the run history and the
+# served-age limit is only a stall detector.
 #
 # This replaces the local launchd ping (deploy/launchd/com.thermalwatch.uptime-
 # ping.plist), which only runs while the laptop is awake.
@@ -18,6 +32,8 @@ on:
 
 permissions:
   contents: read
+  # Liveness is read from this workflow's own run history.
+  actions: read
   # The alert below files and closes an issue, so the staleness is visible
   # wherever the repository's notifications land instead of only in Actions.
   issues: write
@@ -30,16 +46,38 @@ jobs:
       - name: Probe the health endpoint
         env:
           SITE: https://sih26ekaant.web.app
-          # The cycle runs every 30 minutes, so two hours is four missed slots —
-          # that is a broken pipeline, not scheduler jitter or a slow run.
-          MAX_AGE_HOURS: '2'
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Cycled every ~22 minutes with its successor already dispatched, so
+          # 90 minutes is about four missed cycles - a stopped chain, not a slow
+          # runner or a queued job. The chain retries promptly after a failed
+          # cycle, so a single bad run does not trip this.
+          MAX_CYCLE_GAP_MINUTES: '90'
+          # A served cycle this old means publishing has genuinely stalled (the
+          # feed is dead upstream, or deploys are failing) while the loop still
+          # reports success. Twelve hours is well past a quiet satellite feed.
+          MAX_PUBLISH_AGE_HOURS: '12'
         run: |
           set -euo pipefail
           export BODY_PATH="$RUNNER_TEMP/health.json"
+          export RUNS_PATH="$RUNNER_TEMP/cycle-runs.json"
+
           curl -fsS --max-time 30 -D "$RUNNER_TEMP/headers" -o "$BODY_PATH" \
             "$SITE/api/health?probe=$(date +%s)"
           grep -iE '^(HTTP|content-type)' "$RUNNER_TEMP/headers" || true
           cat "$BODY_PATH"
+
+          # Newest successful cycle, straight from the Actions API. A refused or
+          # rate-limited read degrades to "site snapshot only" with a warning
+          # rather than reporting an outage that may not exist.
+          if gh api "repos/$REPO/actions/workflows/live-cycle.yml/runs?status=success&per_page=10" \
+               > "$RUNS_PATH" 2> "$RUNNER_TEMP/runs.err"; then
+            :
+          else
+            echo "::warning::could not read the Live cycle run history - $(cat "$RUNNER_TEMP/runs.err")"
+            echo '{}' > "$RUNS_PATH"
+          fi
+
           {
             echo "### Uptime ping"
             echo '```json'
@@ -47,27 +85,72 @@ jobs:
             echo
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
           python3 - <<'PY'
-          import datetime, json, os, sys
+          import datetime as dt, json, os, sys
+
+          now = dt.datetime.now(dt.timezone.utc)
+
+          def hours_since(stamp: str) -> float:
+              return (now - dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds() / 3600
 
           with open(os.environ["BODY_PATH"]) as fh:
               doc = json.load(fh)
 
-          generated = datetime.datetime.fromisoformat(doc["cycle_generated_at_utc"])
-          age_h = (datetime.datetime.now(datetime.timezone.utc) - generated).total_seconds() / 3600
-          limit = float(os.environ["MAX_AGE_HOURS"])
           archive = doc.get("archive", {})
-          print(f"cycle generated {generated.isoformat()} -> age {age_h:.1f} h (limit {limit:.0f} h)")
+          feed = doc.get("feed", {})
           print(f"archive through {archive.get('last_date')} | {archive.get('detections')} detections")
-          if age_h > limit:
-              print(f"::error::served cycle is {age_h:.1f} h old - the live cycle has stopped publishing")
+          print(f"feed last observation {feed.get('last_observation_utc')}")
+
+          failures = []
+
+          # 1. Is the loop still cycling? This is the signal that catches a
+          #    broken dispatch chain, an expired secret and a quota block alike,
+          #    whether or not anything new was published.
+          try:
+              with open(os.environ["RUNS_PATH"]) as fh:
+                  runs = json.load(fh).get("workflow_runs", [])
+          except (OSError, ValueError):
+              runs = []
+
+          cycle_limit_min = float(os.environ["MAX_CYCLE_GAP_MINUTES"])
+          if runs:
+              finished = max(r["updated_at"] for r in runs)
+              gap_min = hours_since(finished) * 60
+              print(f"last successful cycle finished {finished} -> {gap_min:.0f} min ago "
+                    f"(limit {cycle_limit_min:.0f} min)")
+              if gap_min > cycle_limit_min:
+                  failures.append(
+                      f"no successful Live cycle run has finished in {gap_min:.0f} min "
+                      f"(limit {cycle_limit_min:.0f}) - the dispatch chain has stopped"
+                  )
+          else:
+              print("::warning::Live cycle run history unavailable - only the site was checked")
+
+          # 2. Is the served data itself stuck? Catches a loop that reports
+          #    success while deploys silently fail, and an upstream feed that
+          #    stopped producing.
+          generated = dt.datetime.fromisoformat(doc["cycle_generated_at_utc"])
+          publish_age = (now - generated).total_seconds() / 3600
+          publish_limit = float(os.environ["MAX_PUBLISH_AGE_HOURS"])
+          print(f"published cycle {generated.isoformat()} -> {publish_age:.1f} h old "
+                f"(stall limit {publish_limit:.0f} h)")
+          if publish_age > publish_limit:
+              failures.append(
+                  f"the served cycle was published {publish_age:.1f} h ago "
+                  f"(limit {publish_limit:.0f} h) - publishing has stalled"
+              )
+
+          for why in failures:
+              print(f"::error::{why}")
+          if failures:
               sys.exit(1)
           print("OK")
           PY
 
       # A red X only helps someone who is watching Actions. One issue, kept open
-      # for as long as the site is stale, carries the signal into whatever
-      # notifications the repository already has.
+      # for as long as the pipeline needs attention, carries the signal into
+      # whatever notifications the repository already has.
       - name: File or refresh the staleness issue
         if: failure()
         env:
@@ -80,12 +163,12 @@ jobs:
           existing=$(gh issue list --repo "$REPO" --state open --search "$SEARCH" --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" \
-              --body "Still stale at $(date -u +%FT%TZ)Z. Probe run: $RUN_URL"
+              --body "Still needs attention at $(date -u +%FT%TZ)Z. Probe run: $RUN_URL"
             echo "commented on issue #$existing"
           else
             gh issue create --repo "$REPO" --title "Live cycle has not published recently" \
-              --body "$(printf 'The cycle serving sih26ekaant.web.app is older than the alert limit, so the site is showing stale data.\n\nProbe run: %s\n\nIf the dispatch chain is intact a cycle publishes within about 25 minutes, and this issue closes itself on the next fresh probe.' "$RUN_URL")"
-            echo "filed a staleness issue"
+              --body "$(printf 'The live pipeline needs attention - either no cycle has finished recently (the dispatch chain stopped) or the served archive is very old (publishing stalled). The failing check and its measured value are in this probe run:\n\nProbe run: %s\n\nIf the dispatch chain is intact a cycle finishes within about 25 minutes, and this issue closes itself on the next healthy probe.' "$RUN_URL")"
+            echo "filed an attention issue"
           fi
 
       - name: Close the issue once the site is fresh again
@@ -100,8 +183,8 @@ jobs:
             --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             gh issue close "$existing" --repo "$REPO" \
-              --comment "The served cycle is fresh again at $(date -u +%FT%TZ)Z."
+              --comment "The pipeline is cycling and the served cycle is fresh at $(date -u +%FT%TZ)Z."
             echo "closed issue #$existing"
           else
-            echo 'no open staleness issue'
+            echo 'no open attention issue'
           fi
