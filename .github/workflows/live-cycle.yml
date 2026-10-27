@@ -114,27 +114,84 @@ jobs:
 
       # The quiet time lives at the head of the successor, so the link that keeps
       # the loop alive is created before any idle minute is spent.
-      # Spacing comes from the run history, not from a dispatch payload: the
-      # chain starts its successor immediately (so a killed runner cannot break
-      # the loop) and each run then waits out the remainder of the target gap.
+      #
+      # The pace is measured from the last cycle's OWN start time - a stamp the
+      # running cycle writes into the rolling state - not from run history.
+      # Run timestamps drift: a dispatch creates its successor before sleeping,
+      # so run starts pile up minutes apart and the cycles inherited that shorter
+      # interval, running every 6-9 minutes instead of 22 (about 3x the work and
+      # 3x the release traffic per day). The stamp cannot drift, because this
+      # step reads it only once it holds the concurrency group, i.e. after the
+      # previous cycle has finished writing it - so every lineage re-reads a
+      # fresh anchor and waits out the same gap. The chain still dispatches its
+      # successor immediately (a killed runner cannot break the loop); only the
+      # work is delayed.
+      #
+      # SETUP_SECONDS is the measured stretch between the wait and the cycle:
+      # 105-133 s on a runner. Subtracting a conservative 100 s keeps the floor
+      # at 22 minutes even when setup is quick - a slow setup lengthens the gap,
+      # it can never shorten it.
       - name: Chain spacing
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.SCHEDULE_TOKEN }}
           REPO: ${{ github.repository }}
           SELF: ${{ github.run_id }}
-          TARGET_SECONDS: '1320'          # 22 min between run starts
+          TARGET_SECONDS: '1320'          # 22 min between cycles
+          SETUP_SECONDS: '100'            # measured wait -> cycle stretch
+          STATE_REPO: ${{ vars.CORE_REPO || github.repository }}
+          STATE_TOKEN: ${{ secrets.CORE_PAT || github.token }}
         run: |
           set -uo pipefail
           [ -n "${GH_TOKEN:-}" ] || exit 0
-          ELAPSED=$(curl -fsS --max-time 20 \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/actions/runs?per_page=30" \
-            | python3 -c 'import json,os,sys,datetime as d; me=os.environ["SELF"]; now=d.datetime.now(d.timezone.utc); runs=[r for r in json.load(sys.stdin)["workflow_runs"] if r["name"]=="Live cycle"]; mine=[r for r in runs if str(r["id"])==me]; starts=[d.datetime.fromisoformat(r["run_started_at"].replace("Z","+00:00")) for r in runs if str(r["id"])!=me and r.get("run_started_at")]; print(int((now-max((s for s in starts if mine and s < d.datetime.fromisoformat(mine[0]["run_started_at"].replace("Z","+00:00"))), default=now)).total_seconds()))' \
-            || echo 0)
-          case "$ELAPSED" in (*[!0-9]*|'') ELAPSED=0 ;; esac
-          WAIT=$(( ${TARGET_SECONDS:-1320} - ELAPSED ))
-          echo "previous cycle started ${ELAPSED}s ago; target gap ${TARGET_SECONDS}s"
+
+          # 1. The previous cycle's own start time, as recorded by the run that
+          #    performed it. Deliberately read here, after acquiring the group.
+          STAMP=""
+          if gh release download live-artifacts --repo "$STATE_REPO" \
+               --pattern 'live-state.tar.gz' --dir "$RUNNER_TEMP/pacing" \
+               --clobber >/dev/null 2>&1; then
+            STAMP=$(tar -xzOf "$RUNNER_TEMP/pacing/live-state.tar.gz" \
+                     pipeline_output/live/cycle_started_at.txt 2>/dev/null \
+                   | tr -d '[:space:]' || true)
+          fi
+
+          WAIT=""
+          if [ -n "$STAMP" ]; then
+            WAIT=$(python3 -c '
+          import datetime as d, os, sys
+          target = int(os.environ["TARGET_SECONDS"])
+          try:
+              start = d.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          except ValueError:
+              sys.exit(0)          # unparseable: fall through to run history
+          now = d.datetime.now(d.timezone.utc)
+          age = (now - start).total_seconds()
+          if age > target:
+              sys.exit(0)          # no cycle finished inside the window (a
+                                   # failing loop retries promptly instead of
+                                   # inheriting a stale anchor)
+          print(max(int(start.timestamp()) + target
+                    - int(os.environ["SETUP_SECONDS"]) - int(now.timestamp()), 0))' \
+              "$STAMP" || true)
+          fi
+
+          if [ -n "$WAIT" ]; then
+            echo "previous cycle started ${STAMP}; target gap ${TARGET_SECONDS}s (setup allowance ${SETUP_SECONDS}s)"
+          else
+            # 2. No usable stamp - first run, or a cycle that never finished.
+            #    Fall back to the run history so a cold start still paces itself.
+            ELAPSED=$(curl -fsS --max-time 20 \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/runs?per_page=30" \
+              | python3 -c 'import json,os,sys,datetime as d; me=os.environ["SELF"]; now=d.datetime.now(d.timezone.utc); runs=[r for r in json.load(sys.stdin)["workflow_runs"] if r["name"]=="Live cycle"]; mine=[r for r in runs if str(r["id"])==me]; starts=[d.datetime.fromisoformat(r["run_started_at"].replace("Z","+00:00")) for r in runs if str(r["id"])!=me and r.get("run_started_at")]; print(int((now-max((s for s in starts if mine and s < d.datetime.fromisoformat(mine[0]["run_started_at"].replace("Z","+00:00"))), default=now)).total_seconds()))' \
+              || echo 0)
+            case "$ELAPSED" in (*[!0-9]*|'') ELAPSED=0 ;; esac
+            WAIT=$(( ${TARGET_SECONDS:-1320} - ELAPSED ))
+            [ "$WAIT" -gt 0 ] || WAIT=0
+            echo "no cycle stamp; previous run started ${ELAPSED}s ago; target gap ${TARGET_SECONDS}s"
+          fi
+
           if [ "$WAIT" -gt 0 ]; then
             echo "waiting ${WAIT}s before this cycle"
             sleep "$WAIT"
@@ -249,7 +306,14 @@ jobs:
             --project="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["project_id"])' "$RUNNER_TEMP/firebase-sa.json")"
 
       - name: Run the cycle
-        run: ./scripts/refresh_live_cycle.sh
+        run: |
+          # Stamp this cycle's own start. The successor paces itself off this
+          # file (it arrives in live-state.tar.gz) instead of off run
+          # timestamps, which drift the moment a dispatch creates its successor
+          # before sleeping.
+          mkdir -p pipeline_output/live
+          date -u +%Y-%m-%dT%H:%M:%SZ > pipeline_output/live/cycle_started_at.txt
+          ./scripts/refresh_live_cycle.sh
 
       # refresh_live_cycle.sh redirects all of its output into logs/live_refresh.log,
       # so a failure here would otherwise show an empty red step. Surface the tail.
