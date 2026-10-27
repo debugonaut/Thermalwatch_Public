@@ -208,7 +208,16 @@ jobs:
           # placement needs a PAT that can read it; the core placement falls
           # back to its own run token.
           LIVE_ARTIFACTS_TOKEN: ${{ secrets.CORE_PAT || secrets.GITHUB_TOKEN }}
-        run: .venv/bin/python -m pipeline.provision_live_artifacts
+        # `--profile all` also provisions the web profile: the seven heavy map
+        # assets and four_class_daily.tar.gz. Without them the checkout is
+        # short of what Hosting serves, and the hydrate step's only other source
+        # is the production site itself - roughly 780 MB of Hosting egress per
+        # run. That egress is metered against the same free transfer allowance
+        # visitors consume, so it spent the Spark quota and the site answered
+        # 509 "Bandwidth Quota Exceeded" to everything, hydrate included: the
+        # loop could neither publish nor fetch, and only GitHub's release (free
+        # to store and download) sits outside that metering.
+        run: .venv/bin/python -m pipeline.provision_live_artifacts --profile all
 
       - name: Fill the checkout with everything the live site serves
         run: bash deploy/ci/hydrate_web_assets.sh
