@@ -53,10 +53,17 @@ jobs:
           # runner or a queued job. The chain retries promptly after a failed
           # cycle, so a single bad run does not trip this.
           MAX_CYCLE_GAP_MINUTES: '90'
-          # A served cycle this old means publishing has genuinely stalled (the
-          # feed is dead upstream, or deploys are failing) while the loop still
-          # reports success. Twelve hours is well past a quiet satellite feed.
-          MAX_PUBLISH_AGE_HOURS: '12'
+          # A served cycle this old means publishing has genuinely stalled while
+          # the loop still reports success - but the limit has to clear the
+          # natural gap between scoreable observations, and twelve hours does
+          # not. Measured on the live rolling index on 2026-10-28: the longest
+          # gap between servable rows since September is 12.4 h, and the served
+          # archive was 18 h behind because only MODIS had arrived in that time
+          # (the model cannot score MODIS - MODIS_CONFIDENCE_SCHEMA_UNSUPPORTED -
+          # so a VIIRS gap that long publishes nothing and is not a stall).
+          # 24 h is roughly twice the longest natural gap: it stays quiet while
+          # the sensors sleep and only reports a deploy path dead for a day.
+          MAX_PUBLISH_AGE_HOURS: '24'
         run: |
           set -euo pipefail
           export BODY_PATH="$RUNNER_TEMP/health.json"
